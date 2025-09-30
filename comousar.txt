@@ -1,0 +1,7 @@
+instalar venv Python -m venv venv
+
+instalar requerimientos en carpeta scripts dentro de venv pip install -r requirements.txt
+
+activar el entorno virtual escribiendo actívate
+
+regresar a la carpeta raíz correr el codigo streamlit run main.py
