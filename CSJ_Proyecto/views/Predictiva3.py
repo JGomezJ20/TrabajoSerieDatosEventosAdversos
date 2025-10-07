@@ -1,4 +1,4 @@
-import streamlit as st  
+import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,6 +7,8 @@ import unicodedata
 from datetime import datetime, timedelta
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import MinMaxScaler
 
 warnings.filterwarnings("ignore")
 
@@ -23,23 +25,79 @@ def normalizar(texto):
     )
     return texto
 
-def bimestre_inicio(dt: pd.Timestamp):
-    m = dt.month
-    start_month = m if (m % 2 == 1) else m - 1
-    return datetime(dt.year, start_month, 1)
+def label_quincena_range(start_dt):
+    end_dt = start_dt + timedelta(days=14)
+    return f"{start_dt.day:02d}-{end_dt.day:02d} {MES_ABREV[start_dt.month-1]} {start_dt.year}"
 
-def label_bimestre(dt: pd.Timestamp):
-    m1 = dt.month
-    m2 = m1 + 1
-    return f"{MES_ABREV[m1-1]}-{MES_ABREV[m2-1]} {dt.year}"
+# ---------------------- Métricas ----------------------
+def custom_metrics(y_true, y_pred):
+    y_true = np.array(y_true, dtype=float)
+    y_pred = np.array(y_pred, dtype=float)
+    mask = ~np.isnan(y_true) & ~np.isnan(y_pred)
+    if mask.sum() == 0:
+        return {"MA": np.nan, "MRCE": np.nan, "R2": np.nan}
+    y_true = y_true[mask]
+    y_pred = y_pred[mask]
 
-# ---------------------- Gráfico Quincenal con Predicción ----------------------
+    ma = np.mean(np.abs(y_true - y_pred))
+    mrce = np.mean(np.abs(y_true - y_pred) / np.where(y_true == 0, 1, y_true))
+    r2 = r2_score(y_true, y_pred) if len(y_true) > 1 else np.nan
+
+    return {"MA": ma, "MRCE": mrce, "R2": r2}
+
+# ---------------------- RF Prediction Helper ----------------------
+def rf_predict_series(series, periods, max_lag=6):
+    df_rf = pd.DataFrame({'y': series.values})
+    for lag in range(1, max_lag+1):
+        df_rf[f'lag_{lag}'] = df_rf['y'].shift(lag)
+    df_rf = df_rf.dropna()
+    if df_rf.empty:
+        last_val = series.values[-1] if len(series.values) > 0 else 0.0
+        return np.repeat(last_val, periods), np.full(len(series.values), np.nan)
+
+    X_rf = df_rf[[f'lag_{lag}' for lag in range(1, max_lag+1)]].values
+    y_rf = df_rf['y'].values
+
+    # Normalización
+    scaler_X = MinMaxScaler()
+    scaler_y = MinMaxScaler()
+    X_rf_scaled = scaler_X.fit_transform(X_rf)
+    y_rf_scaled = scaler_y.fit_transform(y_rf.reshape(-1,1)).ravel()
+
+    rf_model = RandomForestRegressor(n_estimators=500, max_depth=10, random_state=42)
+    rf_model.fit(X_rf_scaled, y_rf_scaled)
+
+    preds_hist_scaled = rf_model.predict(X_rf_scaled)
+    preds_hist = scaler_y.inverse_transform(preds_hist_scaled.reshape(-1,1)).ravel()
+
+    preds_hist_full = np.full(len(series.values), np.nan)
+    preds_hist_full[max_lag:] = preds_hist
+
+    last_values = list(series.values[-max_lag:])
+    if len(last_values) < max_lag:
+        last_values = [series.mean()]*(max_lag - len(last_values)) + last_values
+
+    future_preds = []
+    for _ in range(periods):
+        X_input = np.array(last_values[-max_lag:]).reshape(1,-1)
+        X_input_scaled = scaler_X.transform(X_input)
+        pred_scaled = rf_model.predict(X_input_scaled)[0]
+        pred = scaler_y.inverse_transform([[pred_scaled]])[0][0]
+        future_preds.append(pred)
+        last_values.append(pred)
+
+    return np.array(future_preds), preds_hist_full
+
+# ---------------------- Gráfico + Tabla Quincenal ----------------------
 def plot_quincenal(df, periods=4):
     date_col = "Fecha de Ocurrencia"
+    df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
     df = df.dropna(subset=[date_col])
+    if df.empty:
+        st.warning("No hay fechas válidas en el dataset para quincenal.")
+        return
 
-    # Crear quincenas de 15 días consecutivos desde el primer día
     fecha_min = df[date_col].min()
     def quincena_inicio(dt: pd.Timestamp):
         delta = (dt - fecha_min).days
@@ -47,286 +105,170 @@ def plot_quincenal(df, periods=4):
         return fecha_min + timedelta(days=bloque*15)
 
     df["Quincena"] = df[date_col].apply(quincena_inicio)
+    df["Clasificacion_norm"] = df["Clasificación"].apply(lambda x: normalizar(x))
+    df["Servicio_norm"] = df["Servicio Ocurrencia"].apply(lambda x: normalizar(x))
+    df["Evento_norm"] = df["Evento"].apply(lambda x: normalizar(x))
 
-    # Normalizar columnas
-    df["Clasificacion_norm"] = df["Clasificación"].apply(normalizar)
-    df["Servicio_norm"] = df["Servicio Ocurrencia"].apply(normalizar)
-    df["Evento_norm"] = df["Evento"].apply(normalizar)
-
-    # Línea roja: todos los eventos
-    linea_total = df.groupby("Quincena").size()
-
-    # Barras azules: registros incompletos en pabellón
+    linea_total = df.groupby("Quincena").size().sort_index()
     mask_bar = (
-        df["Servicio_norm"] == "pabellon quirurgico"
-    ) & (
-        df["Evento_norm"] == "registros clinicos incompletos / omision"
+        (df["Servicio_norm"] == "pabellon quirurgico") &
+        (df["Evento_norm"] == "registros clinicos incompletos / omision")
     )
-    barras = df[mask_bar].groupby("Quincena").size()
+    barras = df[mask_bar].groupby("Quincena").size().sort_index()
 
-    # Alinear periodos
-    all_q = sorted(set(df["Quincena"]))
+    all_q = sorted(list(set(linea_total.index).union(barras.index)))
     linea_total = linea_total.reindex(all_q, fill_value=0)
     barras = barras.reindex(all_q, fill_value=0)
 
-    # --- Predicciones Lineal ---
     n = len(all_q)
     X = np.arange(n).reshape(-1,1)
-    lin_total_model = LinearRegression().fit(X, linea_total.values)
-    y_lin_future = lin_total_model.predict(np.arange(n, n+periods).reshape(-1,1))
-    lin_bar_model = LinearRegression().fit(X, barras.values)
-    y_bar_future = lin_bar_model.predict(np.arange(n, n+periods).reshape(-1,1))
 
-    # --- Predicciones RF con lags ---
-    def rf_predict_series(series, periods, max_lag=6):
-        df_rf = pd.DataFrame({'y': series.values})
-        for lag in range(1, max_lag+1):
-            df_rf[f'lag_{lag}'] = df_rf['y'].shift(lag)
-        df_rf = df_rf.dropna()
-        if df_rf.empty:
-            return np.repeat(series.values[-1], periods)
-        X_rf = df_rf[[f'lag_{lag}' for lag in range(1, max_lag+1)]].values
-        y_rf = df_rf['y'].values
-        rf_model = RandomForestRegressor(n_estimators=500, max_depth=10, random_state=42)
-        rf_model.fit(X_rf, y_rf)
-        last_values = list(series.values[-max_lag:])
-        if len(last_values) < max_lag:
-            last_values = [series.mean() for _ in range(max_lag - len(last_values))] + last_values
-        future_preds = []
-        for _ in range(periods):
-            pred = rf_model.predict([last_values[-max_lag:]])[0]
-            future_preds.append(pred)
-            last_values.append(pred)
-        return np.array(future_preds)
+    # Lineal
+    if n >= 1:
+        lin_total_model = LinearRegression().fit(X, linea_total.values)
+        y_lin_hist = lin_total_model.predict(X)
+        y_lin_future = lin_total_model.predict(np.arange(n, n+periods).reshape(-1,1))
+        lin_bar_model = LinearRegression().fit(X, barras.values)
+        y_bar_hist = lin_bar_model.predict(X)
+        y_bar_future = lin_bar_model.predict(np.arange(n, n+periods).reshape(-1,1))
+    else:
+        y_lin_hist, y_lin_future, y_bar_hist, y_bar_future = np.array([]), [], np.array([]), []
 
-    y_rf_future_total = rf_predict_series(linea_total, periods)
-    y_rf_future_bar = rf_predict_series(barras, periods)
+    # RF
+    y_rf_future_total, y_rf_hist_total = rf_predict_series(linea_total, periods)
+    y_rf_future_bar, y_rf_hist_bar = rf_predict_series(barras, periods)
 
-    # Fechas futuras
-    future_dates = [all_q[-1] + timedelta(days=15*(i+1)) for i in range(periods)]
-    all_dates = list(all_q) + future_dates
+    y_rf_hist_total_safe = np.where(np.isnan(y_rf_hist_total), linea_total.values, y_rf_hist_total)
+    y_rf_hist_bar_safe = np.where(np.isnan(y_rf_hist_bar), barras.values, y_rf_hist_bar)
 
-    # --- Gráfico ---
+    # Gráfico
     fig, ax1 = plt.subplots(figsize=(12,5))
-    ax1.bar(all_q, barras.values, width=12, alpha=0.7, color="steelblue",
-            label="Registros clínicos incompletos (Pabellón) Real")
-    ax1.bar(future_dates, y_rf_future_bar, width=12, alpha=0.4, color="steelblue",
-            label="Registros incompletos RF Futuro")
+    ax1.bar(np.arange(len(all_q)), barras.values, width=0.4, alpha=0.7, color="steelblue", label="Registros incompletos Real")
+    ax1.bar(np.arange(len(all_q), len(all_q)+periods), y_rf_future_bar, width=0.4, alpha=0.4, color="steelblue", label="Registros incompletos RF Futuro")
     ax1.set_ylabel("Eventos específicos", color="steelblue")
 
     ax2 = ax1.twinx()
-    ax2.plot(all_q, linea_total.values, color="red", marker="o", linewidth=2,
-             label="Total Real")
-    ax2.plot(future_dates, y_lin_future, linestyle="--", marker="o", color="#1f77b4",
-             alpha=0.7, label="Lineal Futuro")
-    ax2.plot(future_dates, y_rf_future_total, linestyle="--", marker="s", color="#2ca02c",
-             alpha=0.7, label="Total RF Futuro")
+    idx = np.arange(len(all_q)+periods)
+    ax2.plot(np.arange(len(all_q)), linea_total.values, color="red", marker="o", linewidth=2, label="Total Real")
+    ax2.plot(np.arange(len(all_q)), y_lin_hist, color="#1f77b4", linewidth=2, marker="o", label="Lineal Histórico")
+    ax2.plot(np.arange(len(all_q)), y_rf_hist_total_safe, color="#2ca02c", linewidth=2, marker="s", label="RF Histórico")
+    ax2.plot(np.arange(len(all_q), len(all_q)+periods), y_lin_future, linestyle="--", marker="o", color="#1f77b4", alpha=0.7, label="Lineal Futuro")
+    ax2.plot(np.arange(len(all_q), len(all_q)+periods), y_rf_future_total, linestyle="--", marker="s", color="#2ca02c", alpha=0.7, label="RF Futuro")
     ax2.set_ylabel("Eventos Totales", color="red")
 
-    def label_quincena_range(start_dt):
-        end_dt = start_dt + timedelta(days=14)
-        return f"{start_dt.day:02d}-{end_dt.day:02d} {MES_ABREV[start_dt.month-1]} {start_dt.year}"
-
-    ax1.set_xticks(all_dates)
-    ax1.set_xticklabels([label_quincena_range(d) for d in all_dates], rotation=45, ha="right")
-
-    plt.title("📊 Gráfico Quincenal con Predicción: Todos los eventos vs Registros incompletos (Pabellón)")
     ax1.legend(loc="upper left")
     ax2.legend(loc="upper right")
+    plt.title("📊 Gráfico Quincenal con Predicción Normalizada")
     fig.tight_layout()
     st.pyplot(fig)
 
-    # --- Tabla con datos ---
+    # Tabla
     tabla_df = pd.DataFrame({
-        "Quincena": [label_quincena_range(d) for d in all_dates],
-        "Fecha inicio": all_dates,
-        "Total eventos": list(linea_total.values)+[np.nan]*periods,
-        "Total eventos Lineal": list(linea_total.values)+list(np.round(y_lin_future,1)),
-        "Total eventos RF": list(linea_total.values)+list(np.round(y_rf_future_total,1)),
-        "Registros incompletos (Pabellón)": list(barras.values)+[np.nan]*periods,
-        "Registros incompletos Lineal": list(barras.values)+list(np.round(y_bar_future,1)),
-        "Registros incompletos RF": list(barras.values)+list(np.round(y_rf_future_bar,1))
+        "Quincena": [label_quincena_range(d) for d in all_q],
+        "Total Real": linea_total.values,
+        "Lineal": np.round(y_lin_hist,2),
+        "RF": np.round(y_rf_hist_total_safe,2),
+        "Error Abs Lineal": np.round(np.abs(linea_total.values - y_lin_hist),2),
+        "Error Abs RF": np.round(np.abs(linea_total.values - y_rf_hist_total_safe),2)
     })
-    st.subheader("📑 Datos del gráfico quincenal con predicción")
-    st.dataframe(tabla_df)
+    st.subheader("📑 Datos Quincenales con predicción")
+    st.dataframe(tabla_df, use_container_width=True)
 
-# ---------------------- Predicciones generales ----------------------
-def generar_predicciones(df, periodo_type, title, periods=6, rf_max_lag=27,
-                         rf_n_estimators=400, rf_max_depth=4, rf_min_samples_leaf=2):
+    # Métricas
+    st.subheader("📊 Métricas Quincenales")
+    met_tot_lin = custom_metrics(linea_total.values, y_lin_hist)
+    met_tot_rf = custom_metrics(linea_total.values, y_rf_hist_total_safe)
+    df_metrics = pd.DataFrame([
+        {"Serie": "Totales - Lineal", **met_tot_lin},
+        {"Serie": "Totales - RF", **met_tot_rf},
+    ])
+    st.dataframe(df_metrics, use_container_width=True)
+
+# ---------------------- Semanal ----------------------
+def generar_predicciones_semanal(df, periods=8, rf_max_lag=6):
     date_col = "Fecha de Ocurrencia"
     df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
     df = df.dropna(subset=[date_col])
 
-    if "Clasificación" not in df.columns:
-        st.error("No se encontró la columna 'Clasificación' en el Excel.")
-        return None, None
-    df = df[df["Clasificación"].str.lower()=="adverso"]
-
-    if df.empty:
-        st.warning(f"No hay registros de 'Adverso' para {title}")
+    df_adverso = df[df["Clasificación"].str.lower()=="adverso"].copy()
+    if df_adverso.empty:
+        st.warning("No hay registros de 'Adverso' para semanal.")
         return None, None
 
-    if periodo_type == "2M":
-        df["__period_start"] = df[date_col].apply(lambda dt: pd.Timestamp(bimestre_inicio(dt)))
-        freq = "2MS"
-    else:
-        df["__period_start"] = df[date_col].dt.to_period("W").apply(lambda r: r.start_time)
-        freq = "W-MON"
+    df_adverso["__period_start"] = df_adverso[date_col].dt.to_period("W").apply(lambda r: r.start_time)
+    series = df_adverso.groupby("__period_start").size().sort_index()
+    all_w = sorted(series.index)
+    series = series.reindex(all_w, fill_value=0)
 
-    df["__count"] = 1
-    min_start = df["__period_start"].min()
-    max_start = df["__period_start"].max()
-    full_range = pd.date_range(start=min_start, end=max_start, freq=freq)
+    n = len(all_w)
+    X = np.arange(n).reshape(-1,1)
+    y = series.values
 
-    series = df.groupby("__period_start")["__count"].sum().reindex(full_range, fill_value=0).sort_index()
-    series_total = series.reset_index()
-    series_total.columns = ["__period_start", "__count"]
-    series_total["idx"] = np.arange(len(series_total))
+    # Lineal
+    lin_reg = LinearRegression().fit(X, y)
+    y_lin_hist = lin_reg.predict(X)
+    y_lin_future = lin_reg.predict(np.arange(n, n+periods).reshape(-1,1))
 
-    n = len(series_total)
-    X = series_total[["idx"]].values
-    y = series_total["__count"].values
+    # RF
+    y_rf_future, y_rf_hist = rf_predict_series(series, periods, max_lag=rf_max_lag)
+    y_rf_hist_safe = np.where(np.isnan(y_rf_hist), series.values, y_rf_hist)
 
-    if n < 3:
-        last_val = float(y[-1]) if n>=1 else 0.0
-        future_lin = np.repeat(last_val, periods)
-        future_rf = np.repeat(last_val, periods)
-        y_pred_lin = y.copy()
-        y_pred_rf_hist = y.copy()
-    else:
-        y_smooth = pd.Series(y).rolling(3, center=True, min_periods=1).median().values
+    # Tabla
+    future_dates = pd.date_range(start=all_w[-1], periods=periods+1, freq="W")[1:]
+    all_dates = list(all_w) + list(future_dates)
 
-        lin_reg = LinearRegression().fit(X, y_smooth)
-        y_pred_lin = lin_reg.predict(X)
-        future_idx = np.arange(len(X), len(X)+periods).reshape(-1,1)
-        future_lin = lin_reg.predict(future_idx)
+    tabla_df = pd.DataFrame({
+        "Semana inicio": [str(d.date()) for d in all_dates[:n]],
+        "Real": series.values,
+        "Lineal": np.round(y_lin_hist,2),
+        "RF": np.round(y_rf_hist_safe,2)
+    })
+    st.subheader("📑 Datos Semanales")
+    st.dataframe(tabla_df, use_container_width=True)
 
-        # RF por lags
-        max_lag = min(rf_max_lag, n)
-        df_rf = series_total.copy()
-        lag_cols = []
-        for lag in range(1, max_lag+1):
-            col = f'lag{lag}'
-            df_rf[col] = df_rf['__count'].shift(lag)
-            lag_cols.append(col)
-        for h in range(1, periods+1):
-            df_rf[f'target_h{h}'] = df_rf['__count'].shift(-h)
+    # Métricas
+    st.subheader("📊 Métricas Semanales")
+    met_lin = custom_metrics(series.values, y_lin_hist)
+    met_rf = custom_metrics(series.values, y_rf_hist_safe)
+    df_metrics = pd.DataFrame([
+        {"Serie": "Semanal - Lineal", **met_lin},
+        {"Serie": "Semanal - RF", **met_rf},
+    ])
+    st.dataframe(df_metrics, use_container_width=True)
 
-        rf_models = {}
-        for h in range(1, periods+1):
-            sub = df_rf.dropna(subset=lag_cols + [f'target_h{h}'])
-            if len(sub) >= max(3, max_lag+1):
-                X_train = sub[lag_cols].values
-                y_train = sub[f'target_h{h}'].values
-                rf = RandomForestRegressor(
-                    random_state=42,
-                    n_estimators=rf_n_estimators,
-                    max_depth=rf_max_depth,
-                    min_samples_leaf=rf_min_samples_leaf,
-                    n_jobs=-1
-                )
-                rf.fit(X_train, y_train)
-                rf_models[h] = rf
-
-        y_pred_rf_hist = np.full(n, np.nan)
-        if 1 in rf_models:
-            sub1 = df_rf.dropna(subset=lag_cols + ['target_h1'])
-            if len(sub1) > 0:
-                X_sub = sub1[lag_cols].values
-                preds = rf_models[1].predict(X_sub)
-                for idx_row, p in zip(sub1.index, preds):
-                    target_idx = idx_row + 1
-                    if 0 <= target_idx < n:
-                        y_pred_rf_hist[target_idx] = p
-        for i in range(n):
-            if np.isnan(y_pred_rf_hist[i]):
-                y_pred_rf_hist[i] = series_total['__count'].iloc[i]
-
-        last_lags = [series_total['__count'].iloc[-l] for l in range(1, max_lag+1)]
-        if len(last_lags) < max_lag:
-            last_lags += [np.mean(last_lags)]*(max_lag - len(last_lags))
-
-        future_rf = []
-        for h in range(1, periods+1):
-            if h in rf_models:
-                future_rf.append(rf_models[h].predict([last_lags])[0])
-            else:
-                future_rf.append(float(np.mean(series_total['__count'].iloc[-max_lag:])))
-
-        future_lin = np.maximum(future_lin, 0)
-        future_rf = np.maximum(np.array(future_rf), 0)
-        y_pred_rf_hist = np.maximum(y_pred_rf_hist, 0)
-
-    future_dates = pd.date_range(start=series_total["__period_start"].iloc[-1], periods=periods+1, freq=freq)[1:]
-
+    # Gráfico
     fig, ax = plt.subplots(figsize=(12,5))
-    all_dates = series_total["__period_start"].tolist() + list(future_dates)
-    lin_total = np.concatenate([y_pred_lin, future_lin])
-    rf_total = np.concatenate([y_pred_rf_hist, future_rf])
-    hist_len = len(y_pred_lin)
-
-    ax.plot(series_total["__period_start"], series_total["__count"], marker="o", color="black", linewidth=2, label="Histórico Real")
-    ax.plot(all_dates[:hist_len], lin_total[:hist_len], marker="o", color="#1f77b4", label="Lineal Histórico", linewidth=2)
-    ax.plot(all_dates[hist_len:], lin_total[hist_len:], linestyle="--", marker="o", color="#1f77b4", alpha=0.7, label="Lineal Futuro", linewidth=2)
-    ax.plot(all_dates[:hist_len], rf_total[:hist_len], marker="s", color="#2ca02c", label="RF Histórico (1-step)", linewidth=2)
-    ax.plot(all_dates[hist_len:], rf_total[hist_len:], linestyle="--", marker="s", color="#2ca02c", alpha=0.7, label="RF Futuro", linewidth=2)
-
-    ax.set_title(title, fontsize=14, fontweight="bold")
-    ax.set_ylabel("Eventos Adversos")
-    plt.xticks(rotation=45)
-    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.plot(np.arange(len(all_w)), series.values, 'k-o', label="Real")
+    ax.plot(np.arange(len(all_w)), y_lin_hist, 'r--', marker='o', label="Lineal Histórico")
+    ax.plot(np.arange(len(all_w)), y_rf_hist_safe, 'g--', marker='s', label="RF Histórico")
+    ax.plot(np.arange(len(all_w), len(all_w)+periods), y_lin_future, 'r:', marker='o', alpha=0.7, label="Lineal Futuro")
+    ax.plot(np.arange(len(all_w), len(all_w)+periods), y_rf_future, 'g:', marker='s', alpha=0.7, label="RF Futuro")
     ax.legend()
+    plt.title("📈 Predicciones Semanales Normalizadas")
+    fig.tight_layout()
     st.pyplot(fig)
 
-    if periodo_type == "2M":
-        labels_hist = [label_bimestre(d) for d in series_total["__period_start"]]
-        labels_future = [label_bimestre(d) for d in future_dates]
-    else:
-        labels_hist = [d.strftime("%Y-%m-%d") for d in series_total["__period_start"]]
-        labels_future = [d.strftime("%Y-%m-%d") for d in future_dates]
-
-    hist_df = pd.DataFrame({
-        "Periodo inicio (fecha)": series_total["__period_start"],
-        "Periodo": labels_hist,
-        "Histórico Real": series_total["__count"],
-        "Lineal": np.round(y_pred_lin,1),
-        "Random Forest": np.round(y_pred_rf_hist,1)
-    })
-    future_df = pd.DataFrame({
-        "Periodo inicio (fecha)": future_dates,
-        "Periodo": labels_future,
-        "Histórico Real": [np.nan]*len(future_dates),
-        "Lineal": np.round(future_lin,1),
-        "Random Forest": np.round(future_rf,1)
-    })
-    result_df = pd.concat([hist_df, future_df], ignore_index=True)
-    st.subheader(f"Tabla: {title}")
-    st.dataframe(result_df)
-    return series_total, result_df
-
-# ---------------------- Main app ----------------------
+# ---------------------- Main App ----------------------
 def main():
-    st.title("📊 Dashboard de Eventos Adversos")
+    st.title("📊 Dashboard de Eventos Adversos (Quincenal + Semanal)")
     uploaded_file = st.file_uploader("📂 Sube tu archivo Excel (.xlsx)", type=["xlsx"])
     if uploaded_file is None:
         st.info("👆 Esperando que subas un archivo Excel...")
         return
+
     df = pd.read_excel(uploaded_file)
-    date_col = "Fecha de Ocurrencia"
-    required_cols = [date_col, "Clasificación", "Servicio Ocurrencia", "Evento"]
+    required_cols = ["Fecha de Ocurrencia", "Clasificación", "Servicio Ocurrencia", "Evento"]
     for col in required_cols:
         if col not in df.columns:
-            st.error(f"⚠️ No se encontró la columna '{col}' en el Excel.")
+            st.error(f"⚠️ Falta columna '{col}' en el Excel.")
             return
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    df = df.dropna(subset=[date_col])
 
-    st.subheader("📊 Gráfico Quincenal: Todos los eventos vs Registros incompletos (Pabellón)")
+    st.header("📈 Análisis Quincenal")
     plot_quincenal(df.copy(), periods=4)
 
-    st.subheader("📈 Predicciones próximas 8 semanas (Adverso)")
-    generar_predicciones(df.copy(), "W", "Predicciones Semanales - Adverso", periods=8, rf_max_lag=6)
+    st.header("📈 Análisis Semanal (Adversos)")
+    generar_predicciones_semanal(df.copy(), periods=8, rf_max_lag=6)
 
 if __name__ == "__main__":
     main()
